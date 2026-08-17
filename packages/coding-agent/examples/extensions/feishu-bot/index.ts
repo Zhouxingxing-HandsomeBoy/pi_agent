@@ -2,35 +2,45 @@
  * Pi Feishu (Lark) Bot Extension
  *
  * Turns a running pi agent into a Feishu bot:
- *   1. Feishu pushes a message event to the webhook exposed by this extension.
+ *   1. Feishu pushes a message event to this extension. By default this uses
+ *      the official long-connection (WebSocket) channel, which needs no
+ *      public HTTPS endpoint. A webhook HTTP server is available as an opt-in
+ *      alternative (FEISHU_WEBHOOK=1) for public deployments.
  *   2. The extension injects the message into the running agent via
  *      `pi.sendUserMessage(text)` (idle user messages always trigger a turn).
  *   3. When the agent settles, the final assistant text is sent back to the
  *      same Feishu chat via the OpenAPI `im/v1/messages` endpoint.
  *
  * Auth model: Feishu open-platform app (app_id + app_secret -> tenant_access_token).
- * Event security: optional Encrypt Key (AES-256-CBC) and/or Verification Token.
+ *
+ * Event reception modes:
+ *   - Long connection (default): Feishu official WebSocket channel. In the
+ *     Feishu console select "使用长连接接收事件" and subscribe to
+ *     im.message.receive_v1. No tunnel / public IP required.
+ *   - Webhook (opt-in): set FEISHU_WEBHOOK=1 to run the HTTP callback server
+ *     (requires a public HTTPS endpoint, e.g. ngrok / cpolar).
+ *   Webhook event security: optional Encrypt Key (AES-256-CBC) and/or
+ *   Verification Token.
  *
  * Config (environment variables):
  *   FEISHU_APP_ID              (required) app id from Feishu developer console
  *   FEISHU_APP_SECRET         (required) app secret
- *   FEISHU_ENCRYPT_KEY        (optional) event encryption key; enables decryption
+ *   FEISHU_WEBHOOK            (optional) set "1" to also enable the webhook server
+ *   FEISHU_ENCRYPT_KEY        (optional) webhook event encryption key
  *   FEISHU_VERIFICATION_TOKEN (optional) verify the `token` field of callbacks
  *   FEISHU_PORT               (optional, default 3000) webhook listen port
  *   FEISHU_PATH               (optional, default /feishu/event) webhook path
  *   FEISHU_RECEIVE_ID_TYPE    (optional, default chat_id) receive_id_type for replies
  *
  * Commands:
- *   /feishu-status   show webhook + token status
+ *   /feishu-status   show connection + token status
  *   /feishu-send <chat_id> <text>   send a test message to a chat
- *
- * Deploy note: Feishu requires a public HTTPS endpoint. Use ngrok / localhost.run
- * during development, or deploy behind a TLS terminator in production.
  */
 
-import * as http from "node:http";
 import * as crypto from "node:crypto";
+import * as http from "node:http";
 import type { ExtensionAPI, ExtensionContext, MessageEndEvent } from "@earendil-works/pi-coding-agent";
+import { Domain, EventDispatcher, LoggerLevel, WSClient } from "@larksuiteoapi/node-sdk";
 
 const FEISHU_BASE = "https://open.feishu.cn";
 
@@ -54,6 +64,7 @@ interface FeishuMessageEvent {
 	chat_id?: string;
 	content?: string;
 	message_type?: string;
+	mentions?: Array<{ key?: string; name?: string }>;
 }
 
 interface FeishuCallback {
@@ -111,8 +122,11 @@ function decrypt(encryptKey: string, b64: string): string {
 
 class FeishuClient {
 	private tokenCache: TokenCache | null = null;
+	private cfg: FeishuConfig;
 
-	constructor(private cfg: FeishuConfig) {}
+	constructor(cfg: FeishuConfig) {
+		this.cfg = cfg;
+	}
 
 	private async getTenantToken(): Promise<string> {
 		if (this.tokenCache && this.tokenCache.expiresAt > Date.now() + 60_000) {
@@ -228,14 +242,80 @@ export default function (pi: ExtensionAPI) {
 
 	function enqueue(chatId: string, text: string): void {
 		const prev = chatQueues.get(chatId) ?? Promise.resolve();
-		const next = prev.then(() => processMessage(text, chatId)).catch((e) => {
-			console.error("[feishu-bot] processing error:", e);
-		});
+		const next = prev
+			.then(() => processMessage(text, chatId))
+			.catch((e) => {
+				console.error("[feishu-bot] processing error:", e);
+			});
 		chatQueues.set(chatId, next);
 	}
 
 	// -------------------------------------------------------------------------
-	// Webhook HTTP server
+	// Shared event handler (used by both long-connection and webhook modes)
+	// -------------------------------------------------------------------------
+
+	function handleMessageEvent(data: { sender?: { sender_type?: string }; message?: FeishuMessageEvent }): void {
+		const message = data.message;
+		const sender = data.sender;
+		if (!message || !message.content) return;
+
+		// Skip messages sent by the bot itself to avoid loops.
+		if (sender?.sender_type === "app") return;
+
+		const messageId = message.message_id;
+		if (messageId) {
+			if (seenMessageIds.has(messageId)) return;
+			seenMessageIds.add(messageId);
+			if (seenMessageIds.size > 2000) seenMessageIds.clear();
+		}
+
+		const chatId = message.chat_id ?? "";
+		let text = "";
+		try {
+			text = (JSON.parse(message.content) as { text?: string }).text ?? "";
+		} catch {
+			text = "";
+		}
+		// Replace mention placeholders (e.g. "@_user_1") with real names so the
+		// agent does not try to resolve them with external tools.
+		for (const mention of message.mentions ?? []) {
+			if (mention.key && mention.name) {
+				text = text.split(mention.key).join(`@${mention.name}`);
+			}
+		}
+		if (!text.trim()) {
+			void client.sendMessage(chatId, "暂仅支持文本消息。").catch(() => {});
+			return;
+		}
+
+		enqueue(chatId, text);
+	}
+
+	// -------------------------------------------------------------------------
+	// Long-connection (WebSocket) mode: Feishu pushes events over the official
+	// long-connection channel. No public HTTPS endpoint / tunnel required.
+	// -------------------------------------------------------------------------
+
+	const wsClient = new WSClient({
+		appId: cfg.appId,
+		appSecret: cfg.appSecret,
+		domain: Domain.Feishu,
+		loggerLevel: LoggerLevel.warn,
+		autoReconnect: true,
+		onReady: () => console.log("[feishu-bot] long-connection established"),
+		onReconnecting: () => console.log("[feishu-bot] long-connection dropped; reconnecting ..."),
+		onReconnected: () => console.log("[feishu-bot] long-connection re-established"),
+		onError: (err: Error) => console.error("[feishu-bot] long-connection failed:", err.message),
+	});
+
+	const dispatcher = new EventDispatcher({}).register({
+		"im.message.receive_v1": handleMessageEvent,
+	});
+
+	void wsClient.start({ eventDispatcher: dispatcher });
+
+	// -------------------------------------------------------------------------
+	// Webhook HTTP server (opt-in via FEISHU_WEBHOOK=1)
 	// -------------------------------------------------------------------------
 
 	const server = http.createServer((req, res) => {
@@ -298,51 +378,26 @@ export default function (pi: ExtensionAPI) {
 			const event = payload.event;
 			if (!event || payload.header?.event_type !== "im.message.receive_v1") return;
 
-			const message = event.message;
-			const sender = event.sender;
-			if (!message || !message.content) return;
-
-			// Skip messages sent by the bot itself to avoid loops.
-			if (sender?.sender_type === "app") return;
-
-			const messageId = message.message_id;
-			if (messageId) {
-				if (seenMessageIds.has(messageId)) return;
-				seenMessageIds.add(messageId);
-				if (seenMessageIds.size > 2000) seenMessageIds.clear();
-			}
-
-			const chatId = message.chat_id ?? "";
-			let text = "";
-			try {
-				text = (JSON.parse(message.content) as { text?: string }).text ?? "";
-			} catch {
-				text = "";
-			}
-			if (!text.trim()) {
-				void client.sendMessage(chatId, "暂仅支持文本消息。").catch(() => {});
-				return;
-			}
-
-			enqueue(chatId, text);
+			handleMessageEvent(event);
 		});
 	});
 
-	server.listen(cfg.port, () => {
-		console.log(`[feishu-bot] webhook listening on http://0.0.0.0:${cfg.port}${cfg.path}`);
-	});
+	if (process.env.FEISHU_WEBHOOK === "1") {
+		server.listen(cfg.port, () => {
+			console.log(`[feishu-bot] webhook listening on http://0.0.0.0:${cfg.port}${cfg.path}`);
+		});
+	}
 
 	// -------------------------------------------------------------------------
 	// Commands
 	// -------------------------------------------------------------------------
 
 	pi.registerCommand("feishu-status", {
-		description: "Show Feishu bot webhook and token status",
+		description: "Show Feishu bot connection and token status",
 		handler: async (_args, ctx: ExtensionContext) => {
-			ctx.ui.notify(
-				`Feishu bot: port=${cfg.port} path=${cfg.path} encrypt=${cfg.encryptKey ? "on" : "off"} token=${cfg.verificationToken ? "on" : "off"}`,
-				"info",
-			);
+			const wsState = wsClient.getConnectionStatus().state;
+			const webhook = process.env.FEISHU_WEBHOOK === "1" ? " webhook=on" : "";
+			ctx.ui.notify(`Feishu bot: ws=${wsState}${webhook} port=${cfg.port} path=${cfg.path}`, "info");
 		},
 	});
 
