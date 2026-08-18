@@ -39,7 +39,7 @@
 
 import * as crypto from "node:crypto";
 import * as http from "node:http";
-import type { ExtensionAPI, ExtensionContext, MessageEndEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, MessageEndEvent, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { Domain, EventDispatcher, LoggerLevel, WSClient } from "@larksuiteoapi/node-sdk";
 
 const FEISHU_BASE = "https://open.feishu.cn";
@@ -206,6 +206,17 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	// Fallback capture: in turns with tool calls the final assistant text may
+	// arrive via turn_end without a matching message_end event. Overwrite the
+	// buffer with the last non-empty assistant text so the reply is never empty.
+	pi.on("turn_end", (event: TurnEndEvent) => {
+		const msg = event.message as { role?: string; content?: unknown };
+		if (msg.role === "assistant") {
+			const text = extractText(msg.content);
+			if (text) replyBuffer = text;
+		}
+	});
+
 	pi.on("agent_settled", () => {
 		if (resolveReply) {
 			const r = resolveReply;
@@ -222,6 +233,10 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			const reply = async () => {
+				// Ack first so the sender knows the message was received.
+				await client.sendMessage(chatId, "✅ 已收到，正在执行任务，完成后回复你…").catch((e) => {
+					console.error("[feishu-bot] send ack failed:", e);
+				});
 				try {
 					pi.sendUserMessage(text);
 				} catch (err) {
